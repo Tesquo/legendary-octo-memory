@@ -31,6 +31,6 @@ go.work.sum
 # .idea/
 .vscode/
 
-# Media
-*media
-media.db
+# Media library and local database
+/media/
+/media.db

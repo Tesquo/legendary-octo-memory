@@ -3,66 +3,116 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 
 	"github.com/go-chi/chi/v5"
 )
 
-func HealthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
+func (s *Server) HealthHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) MediaListHandler(w http.ResponseWriter, r *http.Request) {
+	items, err := s.Store.List()
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Resolve stored on-disk paths into URL-friendly paths for the client.
+	for i := range items {
+		items[i].Thumbnail = relPath(items[i].Thumbnail)
+		items[i].PlayablePath = relPath(items[i].PlayablePath)
+	}
+
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) MediaDetailHandler(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	m, err := s.Store.Get(id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	m.Thumbnail = relPath(m.Thumbnail)
+	m.PlayablePath = relPath(m.PlayablePath)
+
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ProgressHandler streams pipeline progress over Server-Sent Events.
+func (s *Server) ProgressHandler(w http.ResponseWriter, r *http.Request) {
+	s.Hub.ServeSSE(w, r)
+}
+
+// ReprocessHandler re-runs the preparation pipeline for a media item, e.g.
+// after a failed job or if the user wants to switch from remux to transcode.
+func (s *Server) ReprocessHandler(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	m, err := s.Store.Get(id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	src := sourcePath(m.ID, m.Filename)
+	if _, err := os.Stat(src); err != nil {
+		http.Error(w, "source file missing", http.StatusGone)
+		return
+	}
+
+	s.enqueueJob(m.ID, src, m.Duration)
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"id":     m.ID,
+		"status": "queued",
 	})
 }
 
-func MediaListHandler(w http.ResponseWriter, r *http.Request) {
-	rows, err := DB.Query(`SELECT id, filename, thumbnail, duration FROM media ORDER BY created_at DESC`)
-	if err != nil {
-		http.Error(w, "db error", 500)
-		return
-	}
-	defer rows.Close()
-
-	var items []map[string]string
-
-	for rows.Next() {
-		var id, filename, thumbnail, duration string
-		rows.Scan(&id, &filename, &thumbnail, &duration)
-
-		items = append(items, map[string]string{
-			"id":        id,
-			"filename":  filename,
-			"thumbnail": thumbnail,
-			"duration":  duration,
-		})
-	}
-
-	json.NewEncoder(w).Encode(items)
-}
-
-func MediaDetailHandler(w http.ResponseWriter, r *http.Request) {
+// OpenHandler hands the raw source file back to the browser. It is used by the
+// share feature so the host can read the (possibly incompatible) original when
+// no playable rendition exists.
+func (s *Server) OpenHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	row := DB.QueryRow(
-		`
-        SELECT id, filename, duration, width, height, video_codec, audio_codec
-        FROM media WHERE id = ?
-    	`, id)
-
-	var m struct {
-		ID         string  `json:"id"`
-		Filename   string  `json:"filename"`
-		Duration   float64 `json:"duration"`
-		Width      int     `json:"width"`
-		Height     int     `json:"height"`
-		VideoCodec string  `json:"video_codec"`
-		AudioCodec string  `json:"audio_codec"`
-	}
-
-	err := row.Scan(&m.ID, &m.Filename, &m.Duration, &m.Width, &m.Height, &m.VideoCodec, &m.AudioCodec)
+	m, err := s.Store.Get(id)
 	if err != nil {
-		http.Error(w, "not found", 404)
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
-	json.NewEncoder(w).Encode(m)
+	http.ServeFile(w, r, sourcePath(m.ID, m.Filename))
+}
+
+// DeleteHandler removes a media item from the library and deletes its files.
+func (s *Server) DeleteHandler(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	if _, err := s.Store.Get(id); err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.Store.Delete(id); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Best-effort cleanup of artefacts. A failure here leaves orphaned files
+	// but the item is already gone from the user's library, so it is not fatal.
+	if err := os.RemoveAll(mediaDir(id)); err != nil {
+		http.Error(w, "delete files: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
 }

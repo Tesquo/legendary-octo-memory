@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 
 	"github.com/Tesquo/legendary-octo-memory/internal/ffmpeg"
 )
@@ -14,12 +15,11 @@ type Metadata struct {
 	Height     int
 	VideoCodec string
 	AudioCodec string
+	FormatName string
+	BitRate    int64
 }
 
 func ExtractMetadata(path string) (*Metadata, error) {
-	// path = filepath.ToSlash(path)
-	// fmt.Println("Running ffprobe on:", path)
-
 	cmd := exec.Command(ffmpeg.FFprobePath(),
 		"-v", "quiet",
 		"-print_format", "json",
@@ -42,28 +42,42 @@ func ExtractMetadata(path string) (*Metadata, error) {
 			Height    int    `json:"height"`
 		} `json:"streams"`
 		Format struct {
-			Duration string `json:"duration"`
+			Duration   string `json:"duration"`
+			FormatName string `json:"format_name"`
+			BitRate    string `json:"bit_rate"`
 		} `json:"format"`
 	}
 
-	json.Unmarshal(out, &probe)
+	if err := json.Unmarshal(out, &probe); err != nil {
+		return nil, fmt.Errorf("parse ffprobe output: %w", err)
+	}
 
-	md := &Metadata{}
+	md := &Metadata{
+		FormatName: probe.Format.FormatName,
+	}
 
-	// Duration
+	// Duration (ffprobe reports it as a string)
 	if probe.Format.Duration != "" {
-		// convert string to float
-		// (add strconv.ParseFloat here)
+		if d, err := strconv.ParseFloat(probe.Format.Duration, 64); err == nil {
+			md.Duration = d
+		}
+	}
+
+	// Overall bitrate, if the container reports one.
+	if probe.Format.BitRate != "" {
+		if br, err := strconv.ParseInt(probe.Format.BitRate, 10, 64); err == nil {
+			md.BitRate = br
+		}
 	}
 
 	// Streams
 	for _, s := range probe.Streams {
-		if s.CodecType == "video" {
+		if s.CodecType == "video" && md.VideoCodec == "" {
 			md.VideoCodec = s.CodecName
 			md.Width = s.Width
 			md.Height = s.Height
 		}
-		if s.CodecType == "audio" {
+		if s.CodecType == "audio" && md.AudioCodec == "" {
 			md.AudioCodec = s.CodecName
 		}
 	}

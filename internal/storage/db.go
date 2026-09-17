@@ -7,7 +7,7 @@ import (
 )
 
 func InitDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", "media.db")
+	db, err := sql.Open("sqlite3", "media.db?_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}
@@ -22,9 +22,14 @@ func InitDB() (*sql.DB, error) {
         height INTEGER,
         video_codec TEXT,
         audio_codec TEXT,
+        status TEXT DEFAULT 'imported',
+        playable_path TEXT DEFAULT '',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     `
-	_, err = db.Exec(schema)
-	return db, err
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+
+	return db, nil
 }

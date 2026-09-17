@@ -1,13 +1,7 @@
-import Upload from "./Upload";
-import MediaGallery from "./MediaGallery";
+import MediaLibrary from "./MediaLibrary";
 
 function App() {
-  return (
-    <>
-      <Upload />
-      <MediaGallery />
-    </>
-  );
+  return <MediaLibrary />;
 }
 
 export default App;
