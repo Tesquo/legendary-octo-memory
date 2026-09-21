@@ -5,9 +5,20 @@ import {
   reprocess,
   deleteMedia,
   thumbnailUrl,
+  playUrl,
 } from "./lib/api";
+import { LocalSession } from "./lib/MediaSession";
+import { HostSession } from "./lib/webrtc";
 import { useProgress } from "./lib/useProgress";
 import Player from "./Player";
+import ShareToolbar from "./ShareToolbar";
+
+/** Build the viewer link for a room, honouring any sub-path deployment. */
+function buildShareUrl(roomId) {
+  const { origin, pathname } = window.location;
+  const base = pathname.replace(/\/[^/]*$/, "/");
+  return `${origin}${base}#/watch/${roomId}`;
+}
 
 // Status pill shown on each card. Processing shows a live percentage.
 function StatusBadge({ status, progress }) {
@@ -36,12 +47,18 @@ function StatusBadge({ status, progress }) {
 
 export default function MediaLibrary() {
   const [items, setItems] = useState([]);
-  const [selected, setSelected] = useState(null);
+  const [player, setPlayer] = useState(null); // { media, session }
+  const [share, setShare] = useState(null); // { roomId, viewers, copied }
+  const [shareError, setShareError] = useState("");
   const [uploadPct, setUploadPct] = useState(null);
   const [error, setError] = useState("");
 
   const progress = useProgress();
   const fileInputRef = useRef(null);
+
+  // The live host session, and the <video> element being captured for it.
+  const hostRef = useRef(null);
+  const videoElRef = useRef(null);
 
   // Track (media, stage) pairs already handled so each triggers exactly one
   // refresh.
@@ -135,12 +152,110 @@ export default function MediaLibrary() {
     setError("");
     try {
       await deleteMedia(id);
-      setSelected((current) => (current?.id === id ? null : current));
+      // If the deleted item is open in the player, release it too.
+      if (player?.media.id === id) {
+        player.session?.destroy();
+        setPlayer(null);
+      }
       await refresh();
     } catch (err) {
       setError(err.message);
     }
   };
+
+  const stopSharing = () => {
+    hostRef.current?.destroy();
+    hostRef.current = null;
+    videoElRef.current = null;
+    setShareError("");
+    setShare(null);
+  };
+
+  /** Open the player for an item, creating the matching local session. */
+  const openPlayer = (item) => {
+    setPlayer({
+      media: item,
+      session: new LocalSession({ src: playUrl(item.id) }),
+    });
+  };
+
+  const closePlayer = () => {
+    stopSharing();
+    // This component owns the session, so it is responsible for releasing it.
+    player?.session?.destroy();
+    setPlayer(null);
+  };
+
+  /**
+   * Start sharing: open the player and create a room. The media stream is
+   * captured from the host's own <video> element once it is mounted.
+   */
+  const startSharing = async (item) => {
+    setError("");
+    setShareError("");
+    openPlayer(item);
+
+    try {
+      const host = new HostSession({
+        onViewersChange: (viewers) =>
+          setShare((s) => (s ? { ...s, viewers } : s)),
+        // Surfaced in the player footer: a message on the page behind the modal
+        // would never be seen.
+        onError: (err) => setShareError(err.message),
+      });
+      hostRef.current = host;
+
+      const roomId = await host.start();
+      setShare({ roomId, viewers: 0, copied: false });
+
+      // The player may already be mounted; if so, capture from it now.
+      if (videoElRef.current) handleVideoReady(videoElRef.current);
+    } catch (err) {
+      setShareError("Could not start sharing: " + err.message);
+    }
+  };
+
+  /**
+   * Called by the Player once it has attached the session, which is where the
+   * host's <video> element becomes available. captureStream() forwards it as a
+   * live MediaStream, so every viewer shares the host's clock automatically.
+   */
+  const handleVideoReady = (el) => {
+    videoElRef.current = el;
+    if (!el) return;
+
+    const publish = () => {
+      const host = hostRef.current;
+      if (host && el.captureStream) host.publishStream(el.captureStream());
+    };
+
+    // captureStream() before the element has frames produces a stream with no
+    // tracks, which fails silently. Wait for the first frame if necessary.
+    if (el.readyState >= 2) publish();
+    else el.addEventListener("loadeddata", publish, { once: true });
+  };
+
+  const copyShareLink = async () => {
+    if (!share) return;
+    try {
+      await navigator.clipboard.writeText(buildShareUrl(share.roomId));
+      setShare((s) => (s ? { ...s, copied: true } : s));
+      setTimeout(
+        () => setShare((s) => (s ? { ...s, copied: false } : s)),
+        2000,
+      );
+    } catch {
+      setError("Could not copy the link — please copy it manually.");
+    }
+  };
+
+  // Tear down any live session when the library unmounts.
+  useEffect(
+    () => () => {
+      hostRef.current?.destroy();
+    },
+    [],
+  );
 
   return (
     <div className="min-h-full">
@@ -213,7 +328,7 @@ export default function MediaLibrary() {
                 >
                   <button
                     type="button"
-                    onClick={() => setSelected(item)}
+                    onClick={() => openPlayer(item)}
                     className="relative flex aspect-video w-full items-center justify-center bg-black"
                   >
                     {item.thumbnail ? (
@@ -255,6 +370,14 @@ export default function MediaLibrary() {
                       <div className="flex items-center gap-1">
                         <button
                           type="button"
+                          onClick={() => startSharing(item)}
+                          disabled={item.status !== "ready"}
+                          className="rounded-md px-2 py-1 text-[11px] font-medium text-accent transition hover:bg-accent/15 disabled:cursor-not-allowed disabled:text-muted disabled:hover:bg-transparent"
+                        >
+                          Share
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => onReprocess(item.id)}
                           className="rounded-md px-2 py-1 text-[11px] text-muted transition hover:bg-white/10 hover:text-foreground"
                         >
@@ -286,7 +409,34 @@ export default function MediaLibrary() {
         )}
       </main>
 
-      <Player media={selected} onClose={() => setSelected(null)} />
+      {player && (
+        <Player
+          key={player.media.id}
+          session={player.session}
+          title={player.media.filename}
+          subtitle={`${player.media.width}×${player.media.height} · ${player.media.video_codec} / ${player.media.audio_codec || "—"}`}
+          onClose={closePlayer}
+          onVideoReady={handleVideoReady}
+          toolbar={
+            share ? (
+              <ShareToolbar
+                url={buildShareUrl(share.roomId)}
+                viewers={share.viewers}
+                copied={share.copied}
+                onCopy={copyShareLink}
+                onStop={stopSharing}
+              />
+            ) : shareError ? (
+              <span
+                className="max-w-[24rem] shrink-0 truncate text-xs text-red-400"
+                title={shareError}
+              >
+                {shareError}
+              </span>
+            ) : null
+          }
+        />
+      )}
     </div>
   );
 }

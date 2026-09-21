@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { LocalSession } from "./lib/MediaSession";
-import { playUrl } from "./lib/api";
+import { AUTO_PLAY } from "./lib/config";
 
 function formatTime(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -39,16 +38,49 @@ const ICONS = {
 };
 
 /**
- * Player renders a media item through the MediaSession abstraction with fully
- * custom controls. Native controls are disabled so the transport is consistent
- * across browsers and identical for a future WebRTC viewer, who will receive a
- * live stream rather than a seekable file.
+ * Player renders whatever MediaSession it is given, with fully custom controls.
+ * Native controls are disabled so the transport is consistent across browsers.
+ *
+ * The session is owned by the caller, so it can be shared with other concerns
+ * (such as capturing it for WebRTC). Player only attaches it to the <video>
+ * element and subscribes to its events.
+ *
+ * Props:
+ *   session       a MediaSession instance (LocalSession or StreamSession)
+ *   title         primary label shown in the footer
+ *   subtitle      secondary label (codecs, resolution, ...)
+ *   onClose       called when the user dismisses the player
+ *   onVideoReady  receives the <video> element once the session is attached,
+ *                 which is how the host captures it for sharing
+ *   autoPlay      attempt playback on attach; defaults to the configured value
+ *                 (off, so the host presses play deliberately)
+ *   mode          "modal" (host, a centred card) or "page" (viewer, fills the
+ *                 viewport so the video is the focus of the page)
+ *   toolbar       optional node rendered at the right of the footer, used for
+ *                 the share controls so they sit inside the player chrome
  */
-export default function Player({ media, onClose }) {
+export default function Player({
+  session,
+  title,
+  subtitle,
+  onClose,
+  onVideoReady,
+  autoPlay = AUTO_PLAY,
+  mode = "modal",
+  toolbar,
+}) {
   const containerRef = useRef(null);
   const videoRef = useRef(null);
   const sessionRef = useRef(null);
   const hideTimer = useRef(null);
+
+  // Held in a ref so a changing callback identity never re-runs the attach
+  // effect (which would re-bind the media element on every parent render).
+  const videoReadyRef = useRef(onVideoReady);
+
+  useEffect(() => {
+    videoReadyRef.current = onVideoReady;
+  }, [onVideoReady]);
 
   const [state, setState] = useState({
     position: 0,
@@ -62,12 +94,12 @@ export default function Player({ media, onClose }) {
   const [controlsVisible, setControlsVisible] = useState(true);
 
   useEffect(() => {
-    if (!media) return;
+    if (!session) return;
 
-    const session = new LocalSession({ src: playUrl(media.id) });
     sessionRef.current = session;
 
-    if (videoRef.current) session.attach(videoRef.current);
+    const videoEl = videoRef.current;
+    if (videoEl) session.attach(videoEl);
 
     const sync = (s) => setState(s);
     const offs = [
@@ -78,17 +110,24 @@ export default function Player({ media, onClose }) {
       session.on("volumechange", sync),
     ];
 
-    const videoEl = videoRef.current;
-    const onError = () =>
-      setError("This file could not be played. Try re-processing it.");
+    const onError = () => setError("This stream could not be played.");
     videoEl?.addEventListener("error", onError);
+
+    // Let the owner grab the element, e.g. to captureStream() it for sharing.
+    videoReadyRef.current?.(videoEl);
+
+    // The caller opened the player from a click, so playback is permitted here.
+    // A rejection simply leaves the click-to-play overlay in place.
+    if (autoPlay) session.play()?.catch(() => {});
 
     return () => {
       offs.forEach((off) => off?.());
       videoEl?.removeEventListener("error", onError);
-      session.destroy();
+      sessionRef.current = null;
+      // The session is owned by the caller, so it is intentionally not
+      // destroyed here.
     };
-  }, [media]);
+  }, [session, autoPlay]);
 
   const togglePlay = useCallback(() => {
     const s = sessionRef.current;
@@ -127,7 +166,7 @@ export default function Player({ media, onClose }) {
 
   // Keyboard shortcuts. Ignored while typing in an input.
   useEffect(() => {
-    if (!media) return;
+    if (!session) return;
     const onKey = (e) => {
       const tag = e.target?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
@@ -156,7 +195,7 @@ export default function Player({ media, onClose }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [media, togglePlay, seekBy, toggleFullscreen, toggleMute]);
+  }, [session, togglePlay, seekBy, toggleFullscreen, toggleMute]);
 
   // Auto-hide controls after inactivity while playing.
   const revealControls = useCallback(() => {
@@ -169,16 +208,28 @@ export default function Player({ media, onClose }) {
 
   useEffect(() => () => clearTimeout(hideTimer.current), []);
 
-  if (!media) return null;
+  if (!session) return null;
 
+  const canSeek = session.canSeek;
+  const isPage = mode === "page";
   const pct = state.duration ? (state.position / state.duration) * 100 : 0;
   const volumePct = state.muted ? 0 : state.volume * 100;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+    <div
+      className={
+        isPage
+          ? "flex min-h-full w-full items-center justify-center bg-canvas p-4"
+          : "fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+      }
+    >
       <div
         ref={containerRef}
-        className="relative w-full max-w-6xl overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl"
+        className={
+          isPage
+            ? "relative w-full overflow-hidden rounded-2xl border border-border bg-surface"
+            : "relative w-full max-w-6xl overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl"
+        }
         onMouseMove={revealControls}
         onMouseLeave={() => state.playing && setControlsVisible(false)}
       >
@@ -196,7 +247,9 @@ export default function Player({ media, onClose }) {
             ref={videoRef}
             playsInline
             onClick={togglePlay}
-            className="max-h-[75vh] w-full bg-black"
+            className={`w-full bg-black ${
+              isPage ? "max-h-[80vh]" : "max-h-[75vh]"
+            }`}
           />
 
           {/* Click-to-play overlay when paused. */}
@@ -222,24 +275,35 @@ export default function Player({ media, onClose }) {
               controlsVisible ? "opacity-100" : "opacity-0"
             }`}
           >
-            {/* Seek bar with a filled progress indicator. */}
-            <div className="relative mb-3 h-1.5 w-full">
-              <div className="absolute top-0 h-1.5 w-full rounded-full bg-white/25" />
-              <div
-                className="absolute top-0 h-1.5 rounded-full bg-accent"
-                style={{ width: `${pct}%` }}
-              />
-              <input
-                type="range"
-                min={0}
-                max={state.duration || 0}
-                step={0.1}
-                value={state.position}
-                onChange={(e) => sessionRef.current?.seek(Number(e.target.value))}
-                className="absolute inset-0 h-1.5 w-full opacity-0"
-                aria-label="Seek"
-              />
-            </div>
+            {/* A live stream has no timeline, so show a badge instead. */}
+            {canSeek ? (
+              <div className="relative mb-3 h-1.5 w-full">
+                <div className="absolute top-0 h-1.5 w-full rounded-full bg-white/25" />
+                <div
+                  className="absolute top-0 h-1.5 rounded-full bg-accent"
+                  style={{ width: `${pct}%` }}
+                />
+                <input
+                  type="range"
+                  min={0}
+                  max={state.duration || 0}
+                  step={0.1}
+                  value={state.position}
+                  onChange={(e) =>
+                    sessionRef.current?.seek(Number(e.target.value))
+                  }
+                  className="absolute inset-0 h-1.5 w-full opacity-0"
+                  aria-label="Seek"
+                />
+              </div>
+            ) : (
+              <div className="mb-3">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-red-500/90 px-2 py-0.5 text-[11px] font-semibold tracking-wide text-white">
+                  <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                  LIVE
+                </span>
+              </div>
+            )}
 
             <div className="flex items-center gap-3 text-white">
               <button
@@ -303,15 +367,19 @@ export default function Player({ media, onClose }) {
           </div>
         )}
 
-        {/* Title bar sits above the video, outside the controls overlay. */}
+        {/* Title bar sits below the video, outside the controls overlay. */}
         <div className="flex items-center justify-between gap-4 border-t border-border px-4 py-3">
-          <h2 className="truncate text-sm font-medium" title={media.filename}>
-            {media.filename}
-          </h2>
-          <span className="hidden shrink-0 text-xs text-muted sm:block">
-            {media.width}×{media.height} · {media.video_codec} /{" "}
-            {media.audio_codec || "—"}
-          </span>
+          <div className="flex min-w-0 items-center gap-3">
+            <h2 className="truncate text-sm font-medium" title={title}>
+              {title}
+            </h2>
+            {subtitle && (
+              <span className="hidden shrink-0 text-xs text-muted sm:block">
+                {subtitle}
+              </span>
+            )}
+          </div>
+          {toolbar}
         </div>
       </div>
     </div>
