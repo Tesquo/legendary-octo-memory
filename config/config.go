@@ -11,6 +11,13 @@ import (
 // (including future user-facing preferences) should be added here so there is a
 // single, discoverable place for configuration.
 type Config struct {
+	// Host is the interface the HTTP server binds to. It defaults to loopback
+	// because the API is unauthenticated and only the host's own browser is
+	// meant to reach it: a viewer must never call it (see the sharing design).
+	// Set HOST=0.0.0.0 to serve the LAN deliberately.
+	// Env: HOST.
+	Host string
+
 	// Port is the TCP port the HTTP server listens on. Env: PORT.
 	Port string
 
@@ -30,6 +37,7 @@ type Config struct {
 // value that is unset or unparseable.
 func Load() Config {
 	return Config{
+		Host:           envString("HOST", "127.0.0.1"),
 		Port:           envString("PORT", "8080"),
 		WorkerCount:    envInt("WORKER_COUNT", 2),
 		MaxUploadBytes: envInt64("MAX_UPLOAD_BYTES", 8<<30), // 8 GiB

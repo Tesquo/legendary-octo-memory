@@ -99,10 +99,12 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CORS is deliberately not set here: the router's cors middleware owns it
+	// and derives the allowed origin from Config.AllowedOrigins. Hardcoding "*"
+	// would override that and defeat the configuration.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	ch, unsubscribe := h.Subscribe()
 	defer unsubscribe()

@@ -72,9 +72,11 @@ func (s *Server) ReprocessHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// OpenHandler hands the raw source file back to the browser. It is used by the
-// share feature so the host can read the (possibly incompatible) original when
-// no playable rendition exists.
+// OpenHandler hands the raw source file back to the browser. Nothing in the UI
+// calls it today: the player streams the prepared rendition via /play, and the
+// share flow captures the host's <video> element rather than fetching a file.
+// It is kept as the escape hatch for reading the (possibly incompatible)
+// original when no playable rendition exists.
 func (s *Server) OpenHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 

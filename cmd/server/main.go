@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,14 +32,19 @@ func main() {
 
 	router := api.NewRouter(server)
 
+	// Bind to loopback by default. The API is unauthenticated, and by design
+	// only the host's own browser talks to it, so the safe default is that no
+	// other machine on the network can reach it. Set HOST=0.0.0.0 to opt in.
+	addr := net.JoinHostPort(cfg.Host, cfg.Port)
+
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
+		Addr:    addr,
 		Handler: router,
 	}
 
 	// Run the server in the background so we can wait for a shutdown signal.
 	go func() {
-		log.Printf("Server running on http://localhost:%s", cfg.Port)
+		log.Printf("Server running on http://%s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
