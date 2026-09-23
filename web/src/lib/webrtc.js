@@ -113,6 +113,7 @@ export class HostSession {
     this.peer = null;
     this.roomId = null;
     this.stream = null;
+    this.snapshot = null; // latest shared state, replayed to each new viewer
     this.connections = new Map(); // viewerId -> DataConnection
     this.calls = new Map(); // viewerId -> MediaConnection
   }
@@ -137,7 +138,10 @@ export class HostSession {
       this.connections.set(conn.peer, conn);
       this.onViewersChange(this.connections.size);
 
-      // A viewer joining mid-stream should start watching immediately.
+      // A viewer joining mid-stream should start watching immediately, and needs
+      // to know what is playing: it cannot ask the host's API for anything, so
+      // the last known state is replayed as soon as the channel opens.
+      if (this.snapshot) conn.send(this.snapshot);
       if (this.stream) this._callViewer(conn.peer, this.stream);
     });
 
@@ -153,16 +157,50 @@ export class HostSession {
     if (!call) return;
 
     this.calls.set(viewerId, call);
-    call.on("close", () => this.calls.delete(viewerId));
-    call.on("error", () => this.calls.delete(viewerId));
+
+    // Compare identity, not just the viewer id: a call that is replaced by the
+    // next queue item still fires its own close event, and that must not
+    // unregister the call that replaced it.
+    const forget = () => {
+      if (this.calls.get(viewerId) === call) this.calls.delete(viewerId);
+    };
+    call.on("close", forget);
+    call.on("error", forget);
   }
 
-  /** Start (or replace) the stream sent to every viewer. */
+  /** Hang up on one viewer, so the next publish can ring them again. */
+  _endCall(viewerId) {
+    const call = this.calls.get(viewerId);
+    if (!call) return;
+    this.calls.delete(viewerId);
+    call.close();
+  }
+
+  /**
+   * Start, or replace, the stream sent to every viewer. Called on the first
+   * publish and again whenever the host moves to another item.
+   *
+   * PeerJS cannot swap the media on an existing call, so each viewer is hung up
+   * on and called again with the new stream. That is what makes the replacement
+   * visible at all: keeping the old call in place would silently leave viewers
+   * watching the previous item.
+   */
   publishStream(stream) {
     this.stream = stream;
     this.connections.forEach((_conn, viewerId) => {
+      this._endCall(viewerId);
       this._callViewer(viewerId, stream);
     });
+  }
+
+  /**
+   * Remember the current shared state and send it to every connected viewer. The
+   * latest snapshot is replayed to viewers that connect later, so they are never
+   * left guessing what is playing.
+   */
+  setSnapshot(snapshot) {
+    this.snapshot = snapshot;
+    this.broadcast(snapshot);
   }
 
   /** Send a control message to every connected viewer. */
@@ -247,17 +285,30 @@ export class ViewerSession {
   }
 
   _handleCall(call) {
+    // The host calls again when it moves to another item in its queue, so a
+    // previous call is retired before the new one takes over.
+    const previous = this.call;
     this.call = call;
+    if (previous && previous !== call) previous.close();
 
     // Receive-only: the viewer sends nothing back up.
     call.answer();
 
     call.on("stream", (stream) => {
       this.stream = stream;
+      // Media can arrive long after the data channel opened, so report the
+      // connection as usable here too: a stream is the first proof of it.
+      this.onStatus("connected");
       this.onStream(stream);
     });
 
-    call.on("close", () => this.onStatus("ended"));
+    call.on("close", () => {
+      // Only the current call ending means the share is over; a call that was
+      // swapped for the next queue item is not the end of anything.
+      if (this.call !== call) return;
+      this.call = null;
+      this.onStatus("ended");
+    });
     call.on("error", (err) => this.onError(new Error(describeError(err))));
   }
 

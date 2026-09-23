@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { StreamSession } from "./lib/MediaSession";
 import { ViewerSession } from "./lib/webrtc";
+import { currentItem, decodeMessage } from "./lib/protocol";
 import Player from "./Player";
+import QueueBar from "./QueueBar";
 
 const STATUS_TEXT = {
   idle: "Ready to join.",
@@ -23,6 +25,9 @@ export default function WatchPage() {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [stream, setStream] = useState(null);
+  // The host's shared state (its queue, and which entry is playing). Everything
+  // the viewer displays is derived from this; it never calls the host's API.
+  const [remote, setRemote] = useState(null);
   const viewerRef = useRef(null);
 
   // A session is created only once media actually arrives.
@@ -40,6 +45,12 @@ export default function WatchPage() {
     const viewer = new ViewerSession({
       onStatus: setStatus,
       onStream: setStream,
+      // The data channel is the viewer's only source of truth about what it is
+      // watching: it cannot ask the host's backend for anything.
+      onMessage: (data) => {
+        const state = decodeMessage(data);
+        if (state) setRemote(state);
+      },
       onError: (err) => setError(err.message),
     });
     viewerRef.current = viewer;
@@ -56,8 +67,11 @@ export default function WatchPage() {
     viewerRef.current?.destroy();
     viewerRef.current = null;
     setStream(null);
+    setRemote(null);
     setStatus("ended");
   };
+
+  const nowPlaying = currentItem(remote);
 
   if (session) {
     return (
@@ -65,9 +79,16 @@ export default function WatchPage() {
         <Player
           mode="page"
           session={session}
-          title="Shared stream"
-          subtitle="Live from the host"
+          title={nowPlaying ? nowPlaying.filename : "Shared stream"}
+          subtitle={
+            nowPlaying
+              ? `${remote.index + 1} of ${remote.items.length} · live from the host`
+              : "Live from the host"
+          }
           onClose={leave}
+          toolbar={
+            <QueueBar items={remote?.items ?? []} index={remote?.index ?? -1} />
+          }
         />
       </div>
     );
