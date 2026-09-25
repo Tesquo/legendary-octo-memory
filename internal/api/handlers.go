@@ -65,6 +65,11 @@ func (s *Server) ReprocessHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The pipeline keeps one job per item: a job already running (or still
+	// queued) is stopped and waited for before the replacement is submitted, so
+	// two ffmpeg processes never write the same output file.
+	s.Pipeline.CancelAndWait(m.ID)
+
 	s.enqueueJob(m.ID, src, m.Duration)
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"id":     m.ID,
@@ -102,6 +107,12 @@ func (s *Server) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+
+	// Then stop the item's job and wait for it. The row goes first so any
+	// progress event the job still emits lands on nothing, but the files can only
+	// be removed once ffmpeg has exited: a running job keeps writing into
+	// media/<id>/ and would recreate the directory RemoveAll is about to delete.
+	s.Pipeline.CancelAndWait(id)
 
 	// Best-effort cleanup of artefacts. A failure here leaves orphaned files
 	// but the item is already gone from the user's library, so it is not fatal.

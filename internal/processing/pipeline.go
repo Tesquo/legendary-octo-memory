@@ -1,18 +1,10 @@
 package processing
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"strconv"
 	"sync"
-
-	"github.com/Tesquo/legendary-octo-memory/internal/ffmpeg"
 )
 
 // Stage describes where a job is in its lifecycle.
@@ -51,18 +43,32 @@ type Job struct {
 	OutputPath string
 	Strategy   Strategy
 	Duration   float64
+
+	// token identifies the reservation Submit made for this job. Submit sets it,
+	// and it is what tells a job that still owns its slot from one that was
+	// cancelled or replaced while it waited in the queue.
+	token uint64
 }
 
-// Pipeline runs ffmpeg jobs on a bounded pool of goroutines. Each job can be
-// cancelled individually, and progress is reported through a callback so the
+// jobRunner executes one job to completion. It is the seam between the
+// pipeline's bookkeeping — queueing, cancelling, reporting — and the way a job
+// is actually run: production uses ffmpegRunner, while tests substitute a runner
+// that blocks until its context is cancelled instead of spawning a process.
+type jobRunner func(ctx context.Context, job Job, onProgress ProgressFunc) error
+
+// Pipeline runs preparation jobs on a bounded pool of goroutines. Each job can
+// be cancelled individually, and progress is reported through a callback so the
 // API layer can forward it over a websocket.
+//
+// At most one job per media item is ever in flight; see jobRegistry.
 type Pipeline struct {
 	jobs       chan Job
 	wg         sync.WaitGroup
 	onProgress ProgressFunc
+	runner     jobRunner
 
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	// active maps a media item to the job currently holding it.
+	active *jobRegistry
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -81,7 +87,8 @@ func NewPipeline(workers int, onProgress ProgressFunc) *Pipeline {
 	p := &Pipeline{
 		jobs:       make(chan Job, 64),
 		onProgress: onProgress,
-		cancels:    make(map[string]context.CancelFunc),
+		runner:     ffmpegRunner,
+		active:     newJobRegistry(),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -93,8 +100,16 @@ func NewPipeline(workers int, onProgress ProgressFunc) *Pipeline {
 	return p
 }
 
-// Submit queues a job for processing.
-func (p *Pipeline) Submit(job Job) {
+// Submit queues a job for processing. It reports whether the job was accepted:
+// an item that already has work in flight is refused, because two jobs for one
+// item would run two ffmpeg processes over the same output file.
+func (p *Pipeline) Submit(job Job) bool {
+	token, ok := p.active.reserve(job.MediaID)
+	if !ok {
+		return false
+	}
+	job.token = token
+
 	p.onProgress(ProgressEvent{
 		MediaID:  job.MediaID,
 		Stage:    StageQueued,
@@ -105,17 +120,24 @@ func (p *Pipeline) Submit(job Job) {
 
 	select {
 	case p.jobs <- job:
+		return true
 	case <-p.ctx.Done():
+		// Shutting down: nothing will consume the queue, so drop the job's
+		// reservation with it.
+		p.active.release(job.MediaID, token)
+		return false
 	}
 }
 
-// Cancel stops the running job for a given media ID, if any.
-func (p *Pipeline) Cancel(mediaID string) {
-	p.mu.Lock()
-	cancel, ok := p.cancels[mediaID]
-	p.mu.Unlock()
-	if ok {
-		cancel()
+// CancelAndWait stops the job in flight for a media item and waits until it has
+// stopped. A job still waiting in the queue is dropped before it can start.
+//
+// Callers that delete an item or replace its job must wait: an ffmpeg process
+// keeps writing into the item's directory until it dies, so anything done to
+// those files — or the status set for the item — races the job otherwise.
+func (p *Pipeline) CancelAndWait(mediaID string) {
+	if done := p.active.cancel(mediaID); done != nil {
+		<-done
 	}
 }
 
@@ -141,79 +163,47 @@ func (p *Pipeline) worker() {
 }
 
 func (p *Pipeline) run(job Job) {
-	// Register a per-job cancel so it can be stopped independently.
 	ctx, cancel := context.WithCancel(p.ctx)
-	p.mu.Lock()
-	p.cancels[job.MediaID] = cancel
-	p.mu.Unlock()
 
-	defer func() {
+	// Claim the reservation Submit made for this job. A job whose item was
+	// deleted or re-queued while it waited must not start now: it would recreate
+	// the directory a delete just removed, or race the job that replaced it.
+	if !p.active.claim(job.MediaID, job.token, cancel) {
 		cancel()
-		p.mu.Lock()
-		delete(p.cancels, job.MediaID)
-		p.mu.Unlock()
-	}()
-
-	if err := os.MkdirAll(filepath.Dir(job.OutputPath), 0755); err != nil {
-		p.fail(job, fmt.Sprintf("create output dir: %v", err))
 		return
 	}
+	defer p.active.release(job.MediaID, job.token)
+	defer cancel()
 
-	args := buildArgs(job)
-	if args == nil {
-		p.fail(job, "unsupported strategy")
-		return
-	}
+	err := p.runner(ctx, job, p.onProgress)
 
-	p.onProgress(ProgressEvent{
-		MediaID:  job.MediaID,
-		Stage:    StageProcessing,
-		Strategy: job.Strategy.String(),
-		Percent:  0,
-		Message:  job.Strategy.String(),
-	})
-
-	cmd := exec.CommandContext(ctx, ffmpeg.FFmpegPath(), args...)
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		p.fail(job, fmt.Sprintf("stderr pipe: %v", err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		p.fail(job, fmt.Sprintf("start ffmpeg: %v", err))
-		return
-	}
-
-	// Tail ffmpeg's stderr for `time=HH:MM:SS.xx` and translate it into a
-	// percentage of the known duration.
-	go scanProgress(stderr, job, p.onProgress)
-
-	waitErr := cmd.Wait()
-
-	if ctx.Err() == context.Canceled {
+	switch {
+	case errors.Is(err, context.Canceled):
+		// A cancel from a caller (delete, re-process) supersedes the job: the
+		// caller is about to drop the row or start a replacement, so reporting a
+		// status here would only flash one nobody is waiting for. Shutdown
+		// cancels through the pipeline's own context, has nobody waiting to move
+		// the item on, and still reports.
+		if p.active.canceledByCaller(job.MediaID, job.token) {
+			return
+		}
 		p.onProgress(ProgressEvent{
 			MediaID:  job.MediaID,
 			Stage:    StageCanceled,
 			Strategy: job.Strategy.String(),
 			Message:  "canceled",
 		})
-		return
+	case err != nil:
+		p.fail(job, err.Error())
+	default:
+		p.onProgress(ProgressEvent{
+			MediaID:  job.MediaID,
+			Stage:    StageDone,
+			Strategy: job.Strategy.String(),
+			Percent:  100,
+			Message:  "ready",
+		})
 	}
-
-	if waitErr != nil {
-		p.fail(job, fmt.Sprintf("ffmpeg: %v", waitErr))
-		return
-	}
-
-	p.onProgress(ProgressEvent{
-		MediaID:  job.MediaID,
-		Stage:    StageDone,
-		Strategy: job.Strategy.String(),
-		Percent:  100,
-		Message:  "ready",
-	})
 }
 
 func (p *Pipeline) fail(job Job, msg string) {
@@ -226,71 +216,3 @@ func (p *Pipeline) fail(job Job, msg string) {
 	})
 }
 
-// buildArgs returns the ffmpeg arguments for a job, or nil if the strategy
-// needs no work.
-func buildArgs(job Job) []string {
-	switch job.Strategy {
-	case StrategyRemux:
-		// Copy streams unchanged into a browser-friendly fragmented MP4.
-		return []string{
-			"-y",
-			"-i", job.SourcePath,
-			"-c", "copy",
-			"-movflags", "+faststart",
-			job.OutputPath,
-		}
-	case StrategyTranscode:
-		// Re-encode to H.264/AAC, capping width at 1920 without upscaling.
-		return []string{
-			"-y",
-			"-i", job.SourcePath,
-			"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-			"-vf", "scale='min(1920,iw)':-2",
-			"-c:a", "aac", "-b:a", "128k",
-			"-movflags", "+faststart",
-			job.OutputPath,
-		}
-	default:
-		return nil
-	}
-}
-
-var timeRe = regexp.MustCompile(`time=(\d+):(\d+):(\d+(?:\.\d+)?)`)
-
-// scanProgress reads ffmpeg's stderr word by word and emits a percentage once
-// per parsed timestamp. ffmpeg emits progress on stderr, not stdout.
-func scanProgress(r io.Reader, job Job, onProgress ProgressFunc) {
-	scanner := bufio.NewScanner(r)
-	scanner.Split(bufio.ScanWords)
-
-	for scanner.Scan() {
-		m := timeRe.FindStringSubmatch(scanner.Text())
-		if m == nil {
-			continue
-		}
-
-		hours, _ := strconv.Atoi(m[1])
-		mins, _ := strconv.Atoi(m[2])
-		secs, _ := strconv.ParseFloat(m[3], 64)
-
-		elapsed := float64(hours*3600+mins*60) + secs
-		percent := 0.0
-		if job.Duration > 0 {
-			percent = (elapsed / job.Duration) * 100
-		}
-		if percent > 99 {
-			percent = 99
-		}
-		if percent < 0 {
-			percent = 0
-		}
-
-		onProgress(ProgressEvent{
-			MediaID:  job.MediaID,
-			Stage:    StageProcessing,
-			Strategy: job.Strategy.String(),
-			Percent:  percent,
-			Message:  "processing",
-		})
-	}
-}

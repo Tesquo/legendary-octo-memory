@@ -120,11 +120,21 @@ func (s *Server) enqueueJob(id, srcPath string, duration float64) {
 	}
 
 	s.Store.SetStatus(id, storage.StatusProcessing)
-	s.Pipeline.Submit(processing.Job{
+	if !s.Pipeline.Submit(processing.Job{
 		MediaID:    id,
 		SourcePath: srcPath,
 		OutputPath: playablePath(id),
 		Strategy:   strategy,
 		Duration:   duration,
-	})
+	}) {
+		// Refused: the item already has a job in flight, or the pipeline is
+		// shutting down. Nothing is coming either way, so do not leave the row
+		// claiming to be processing forever.
+		s.Store.SetStatus(id, storage.StatusFailed)
+		s.Hub.Publish(id, processing.ProgressEvent{
+			MediaID: id,
+			Stage:   processing.StageFailed,
+			Message: "could not queue job",
+		})
+	}
 }
