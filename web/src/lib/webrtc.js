@@ -101,6 +101,32 @@ function describeError(err) {
 }
 
 /**
+ * Ask PeerJS to reach the signalling server again after its socket drops.
+ *
+ * PeerJS does not reconnect on its own, and without this a blip is permanent:
+ * the peer-to-peer connections — and any media already flowing — survive the
+ * drop (PeerJS keeps them, only the broker socket is gone), but a host can no
+ * longer be reached by a new viewer and a viewer that had not joined yet can
+ * never join, until the page is reloaded. `reconnect()` reuses the same id, so
+ * the room id — and therefore the share link — stays valid.
+ *
+ * It is deliberately silent: the signalling socket says nothing about the media
+ * path, so a reconnect that works must not surface as a connection problem. One
+ * that cannot work raises a "network" error, which both sessions already report.
+ */
+function reconnectAfterBlip(peer) {
+  peer.on("disconnected", () => {
+    if (peer.destroyed) return;
+
+    try {
+      peer.reconnect();
+    } catch {
+      // Destroyed, or already reconnecting: there is nothing left to do.
+    }
+  });
+}
+
+/**
  * HostSession owns the room. It waits for viewers to connect, then pushes the
  * captured MediaStream to each of them.
  */
@@ -126,6 +152,9 @@ export class HostSession {
 
     // Runtime errors (after opening) are reported but not fatal.
     peer.on("error", (err) => this.onError(new Error(describeError(err))));
+
+    // Reclaim the room after a signalling blip, so viewers can still find it.
+    reconnectAfterBlip(peer);
 
     // A viewer opens a data connection first; that reveals their peer id.
     peer.on("connection", (conn) => this._handleConnection(conn));
@@ -274,6 +303,10 @@ export class ViewerSession {
       this.onStatus("failed");
       this.onError(new Error(describeError(err)));
     });
+
+    // The host may have been cut off from the broker rather than gone; speaking
+    // to it again is what lets a retry succeed instead of failing forever.
+    reconnectAfterBlip(peer);
 
     const conn = peer.connect(roomId, { reliable: true });
     this.conn = conn;

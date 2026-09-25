@@ -39,6 +39,11 @@ export default function WatchPage() {
   useEffect(() => () => viewerRef.current?.destroy(), []);
 
   const join = async () => {
+    // A retry after a failed join must not leave the previous attempt's peer —
+    // and its registration on the broker — behind.
+    viewerRef.current?.destroy();
+    viewerRef.current = null;
+
     setError("");
     setStatus("connecting");
 
