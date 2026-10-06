@@ -10,6 +10,13 @@ import (
 func NewRouter(s *Server) http.Handler {
 	r := chi.NewRouter()
 
+	// Security headers on every response, then the origin guard, then CORS. The
+	// guard runs ahead of CORS on purpose: CORS only withholds response headers
+	// from a disallowed origin, it does not reject the request, so on its own it
+	// would still let a cross-site page post /upload or delete a media item.
+	r.Use(securityHeaders)
+	r.Use(s.guardRequests)
+
 	// CORS so the Vite dev server (and any static host) can talk to the API.
 	// Origins are configuration-driven so a deployed frontend can be added
 	// without a code change.

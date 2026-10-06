@@ -91,6 +91,13 @@ func (s *Server) OpenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Force a download. The escape hatch hands back the original file under its
+	// own name and extension, and a filename a user chose may well end in .html
+	// or .svg — rendering that inline would execute it in the API's origin.
+	if disposition := attachmentDisposition(m.Filename); disposition != "" {
+		w.Header().Set("Content-Disposition", disposition)
+	}
+
 	http.ServeFile(w, r, sourcePath(m.ID, m.Filename))
 }
 

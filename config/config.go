@@ -14,7 +14,8 @@ type Config struct {
 	// Host is the interface the HTTP server binds to. It defaults to loopback
 	// because the API is unauthenticated and only the host's own browser is
 	// meant to reach it: a viewer must never call it (see the sharing design).
-	// Set HOST=0.0.0.0 to serve the LAN deliberately.
+	// Set HOST=0.0.0.0 to serve the LAN deliberately; the request guard can no
+	// longer verify the Host header in that mode (see internal/api/guard.go).
 	// Env: HOST.
 	Host string
 
@@ -28,7 +29,10 @@ type Config struct {
 	// MaxUploadBytes caps the size of a single uploaded file. Env: MAX_UPLOAD_BYTES.
 	MaxUploadBytes int64
 
-	// AllowedOrigins are the CORS origins permitted to call the API.
+	// AllowedOrigins are the origins permitted to make state-changing calls to
+	// the API. They feed both the CORS response headers and the server-side
+	// origin guard, which is what actually rejects a disallowed cross-site
+	// request (see internal/api/guard.go). Origin only, no path.
 	// Env: ALLOWED_ORIGINS (comma-separated).
 	AllowedOrigins []string
 }
@@ -41,7 +45,14 @@ func Load() Config {
 		Port:           envString("PORT", "8080"),
 		WorkerCount:    envInt("WORKER_COUNT", 2),
 		MaxUploadBytes: envInt64("MAX_UPLOAD_BYTES", 8<<30), // 8 GiB
-		AllowedOrigins: envStringSlice("ALLOWED_ORIGINS", []string{"http://localhost:5173"}),
+		// Defaults cover the Vite dev server and the published origin the host's
+		// browser loads when it runs the static UI. A UI served by this binary
+		// itself needs no entry here: a same-origin request is always accepted.
+		// Override with your own deployment's origin (origin only, no path).
+		AllowedOrigins: envStringSlice("ALLOWED_ORIGINS", []string{
+			"http://localhost:5173",
+			"https://tesquo.github.io",
+		}),
 	}
 }
 
