@@ -54,8 +54,9 @@ const ICONS = {
  *                 which is how the host captures it for sharing
  *   autoPlay      attempt playback on attach; defaults to the configured value
  *                 (off, so the host presses play deliberately)
- *   mode          "modal" (host, a centred card) or "page" (viewer, fills the
- *                 viewport so the video is the focus of the page)
+ *   mode          "modal" (host, a centred card), "page" (viewer, fills the
+ *                 viewport) or "theatre" (fills the space it is given, so a
+ *                 sidebar can sit beside it)
  *   toolbar       optional node rendered at the right of the footer, used for
  *                 the share controls so they sit inside the player chrome
  */
@@ -211,24 +212,35 @@ export default function Player({
   if (!session) return null;
 
   const canSeek = session.canSeek;
-  const isPage = mode === "page";
+  // Unknown modes fall back to "modal" rather than rendering an unstyled shell.
+  const layout =
+    mode === "page" || mode === "theatre" ? mode : "modal";
   const pct = state.duration ? (state.position / state.duration) * 100 : 0;
   const volumePct = state.muted ? 0 : state.volume * 100;
 
   return (
     <div
       className={
-        isPage
-          ? "flex min-h-full w-full items-center justify-center bg-canvas p-4"
-          : "fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+        {
+          page: "flex min-h-full w-full items-center justify-center bg-canvas p-4",
+          // In theatre mode the player is an in-flow flex child: the parent lays
+          // out the player and its sidebar side by side.
+          theatre: "flex min-w-0 flex-1 items-center justify-center",
+          modal:
+            "fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm",
+        }[layout]
       }
     >
       <div
         ref={containerRef}
         className={
-          isPage
-            ? "relative w-full overflow-hidden rounded-2xl border border-border bg-surface"
-            : "relative w-full max-w-6xl overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl"
+          {
+            page: "relative w-full overflow-hidden rounded-2xl border border-border bg-surface",
+            theatre:
+              "relative w-full overflow-hidden rounded-2xl border border-border bg-surface shadow-lg",
+            modal:
+              "relative w-full max-w-6xl overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl",
+          }[layout]
         }
         onMouseMove={revealControls}
         onMouseLeave={() => state.playing && setControlsVisible(false)}
@@ -248,7 +260,11 @@ export default function Player({
             playsInline
             onClick={togglePlay}
             className={`w-full bg-black ${
-              isPage ? "max-h-[80vh]" : "max-h-[75vh]"
+              {
+                page: "max-h-[80vh]",
+                theatre: "max-h-[calc(100vh-11rem)]",
+                modal: "max-h-[75vh]",
+              }[layout]
             }`}
           />
 

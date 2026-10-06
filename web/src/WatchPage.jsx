@@ -4,29 +4,40 @@ import { StreamSession } from "./lib/MediaSession";
 import { ViewerSession } from "./lib/webrtc";
 import { currentItem, decodeMessage } from "./lib/protocol";
 import Player from "./Player";
-import QueueBar from "./QueueBar";
+import RoomSidebar from "./RoomSidebar";
 
 const STATUS_TEXT = {
   idle: "Ready to join.",
   connecting: "Connecting to the host…",
   connected: "Connected — waiting for the host to start playing…",
   disconnected: "The connection dropped.",
-  ended: "The host stopped sharing.",
+  ended: "The host ended the session.",
   failed: "Could not connect.",
 };
+
+/** Stands in for the player until the host's stream arrives. */
+function WaitingStage({ text }) {
+  return (
+    <div className="flex aspect-video w-full min-w-0 flex-1 flex-col items-center justify-center rounded-2xl border border-border bg-surface shadow-lg">
+      <span className="h-8 w-8 animate-spin rounded-full border-2 border-border border-t-accent" />
+      <p className="mt-4 max-w-xs text-center text-sm text-muted">{text}</p>
+    </div>
+  );
+}
 
 /**
  * WatchPage is the viewer side of a share link. It is deliberately independent
  * of the Go API: on a viewer's machine "localhost" is their own computer, so
- * everything it needs arrives over WebRTC.
+ * everything it needs arrives over WebRTC — the playlist on the data channel,
+ * the video as the host's live stream.
  */
 export default function WatchPage() {
   const { roomId } = useParams();
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [stream, setStream] = useState(null);
-  // The host's shared state (its queue, and which entry is playing). Everything
-  // the viewer displays is derived from this; it never calls the host's API.
+  // The host's shared state (its playlist, and which entry is on air).
+  // Everything the viewer displays is derived from this.
   const [remote, setRemote] = useState(null);
   const viewerRef = useRef(null);
 
@@ -75,26 +86,45 @@ export default function WatchPage() {
     setRemote(null);
     setStatus("ended");
   };
-
   const nowPlaying = currentItem(remote);
+  // The room opens as soon as the data channel is up: the playlist arrives
+  // before any video does, and a viewer should see where the queue stands while
+  // it waits for the host to start.
+  const joined = status === "connected" || Boolean(session);
 
-  if (session) {
+  if (joined) {
     return (
       <div className="min-h-screen bg-canvas">
-        <Player
-          mode="page"
-          session={session}
-          title={nowPlaying ? nowPlaying.filename : "Shared stream"}
-          subtitle={
-            nowPlaying
-              ? `${remote.index + 1} of ${remote.items.length} · live from the host`
-              : "Live from the host"
-          }
-          onClose={leave}
-          toolbar={
-            <QueueBar items={remote?.items ?? []} index={remote?.index ?? -1} />
-          }
-        />
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 p-4 sm:px-6 lg:flex-row lg:items-start">
+          <div className="flex min-w-0 justify-center lg:flex-1">
+            {session ? (
+              <Player
+                mode="theatre"
+                session={session}
+                title={nowPlaying ? nowPlaying.filename : "Shared stream"}
+                subtitle={
+                  nowPlaying
+                    ? `${remote.index + 1} of ${remote.items.length} · live from the host`
+                    : "Live from the host"
+                }
+                onClose={leave}
+              />
+            ) : (
+              <WaitingStage text={STATUS_TEXT[status]} />
+            )}
+          </div>
+
+          <RoomSidebar
+            role="viewer"
+            items={remote?.items ?? []}
+            index={remote?.index ?? -1}
+            statusText={
+              session
+                ? "Live — you're watching the host's player."
+                : STATUS_TEXT[status]
+            }
+          />
+        </div>
       </div>
     );
   }
@@ -146,3 +176,4 @@ export default function WatchPage() {
     </div>
   );
 }
+

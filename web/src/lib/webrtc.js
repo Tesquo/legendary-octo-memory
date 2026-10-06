@@ -1,4 +1,5 @@
 import Peer from "peerjs";
+import { ICE_SERVERS } from "./config";
 
 // --- Sharing strategy: PeerJS implementation -----------------------------
 //
@@ -23,15 +24,9 @@ import Peer from "peerjs";
 // Sync note: because the host sends a single live MediaStream, every viewer
 // shares one clock automatically. No drift correction is needed.
 
-// STUN lets peers discover their public address and connect directly. TURN is
-// the relay fallback for the ~10-20% of pairs that cannot connect directly
-// (symmetric NAT, some mobile networks). Add a TURN entry to `iceServers` to
-// improve reliability; until then those pairs simply fail to connect.
-const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
-  // { urls: "turn:your.turn.server:3478", username: "...", credential: "..." },
-];
-
+// ICE servers (STUN, and TURN when configured) are a deployment concern, not a
+// transport one, so they live in config: set `VITE_ICE_SERVERS` to add a relay
+// without touching this file. See lib/config.js and README.md § "TURN relay".
 const PEER_OPTIONS = {
   debug: 1,
   config: { iceServers: ICE_SERVERS },

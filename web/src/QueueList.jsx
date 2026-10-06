@@ -1,71 +1,98 @@
 /**
- * QueueList is the host's queue as a list: the one place queued items are shown
- * in order. It is host-only UI — viewers are read-only and are told about the
- * queue over the data channel instead (see lib/protocol.js).
+ * QueueList is the room's playlist: the one place queued items are shown in
+ * order, and the only view of the host's media that a viewer ever gets.
+ *
+ * It renders in the room sidebar for both roles. A host can play, remove and
+ * clear entries; a viewer is read-only and cannot change anything — it is only
+ * told about the queue over the data channel (see lib/protocol.js).
  */
-export default function QueueList({ items, index, onPlay, onRemove, onClear }) {
-  if (items.length === 0) return null;
-
+export default function QueueList({
+  items = [],
+  index = -1,
+  onPlay,
+  onRemove,
+  onClear,
+  readOnly = false,
+}) {
   return (
-    <section className="mb-6 rounded-2xl border border-border bg-surface p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-sm font-medium">
-          Queue{" "}
-          <span className="text-muted">
-            ({items.length} {items.length === 1 ? "item" : "items"})
-          </span>
+    <div>
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">
+          {readOnly ? "Up next" : "Playlist"}
         </h2>
-
-        <button
-          type="button"
-          onClick={onClear}
-          className="rounded-md px-2 py-1 text-[11px] text-muted transition hover:bg-white/10 hover:text-foreground"
-        >
-          Clear
-        </button>
+        {!readOnly && items.length > 0 && (
+          <button
+            type="button"
+            onClick={onClear}
+            className="rounded-md px-2 py-0.5 text-[11px] text-muted transition hover:bg-white/10 hover:text-foreground"
+          >
+            Clear
+          </button>
+        )}
       </div>
 
-      <ol className="space-y-1">
-        {items.map((item, i) => (
-          <li
-            key={item.id}
-            className={`flex items-center gap-3 rounded-lg px-2 py-1.5 ${
-              i === index ? "bg-accent/15" : "hover:bg-white/5"
-            }`}
-          >
-            <span className="w-5 shrink-0 text-right text-[11px] tabular-nums text-muted">
-              {i + 1}
-            </span>
+      {items.length === 0 ? (
+        <p className="mt-3 text-xs text-muted">
+          {readOnly
+            ? "Nothing queued yet."
+            : "Nothing here yet — add media below."}
+        </p>
+      ) : (
+        <ol className="mt-2 max-h-[34vh] space-y-1 overflow-y-auto pr-1">
+          {items.map((item, i) => {
+            const current = i === index;
+            return (
+              <li
+                key={item.id}
+                className={`group flex items-center gap-2 rounded-lg px-2 py-1.5 ${
+                  current ? "bg-accent/15" : "hover:bg-white/5"
+                }`}
+              >
+                <span className="w-4 shrink-0 text-right text-[11px] tabular-nums text-muted">
+                  {i + 1}
+                </span>
 
-            <button
-              type="button"
-              onClick={() => onPlay(item)}
-              title={item.filename}
-              className="min-w-0 flex-1 truncate text-left text-sm"
-            >
-              {item.filename}
-            </button>
+                {readOnly ? (
+                  <span
+                    title={item.filename}
+                    className={`min-w-0 flex-1 truncate text-sm ${
+                      current ? "" : "text-muted"
+                    }`}
+                  >
+                    {item.filename}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => onPlay(item)}
+                    title={item.filename}
+                    className="min-w-0 flex-1 truncate text-left text-sm transition hover:text-accent"
+                  >
+                    {item.filename}
+                  </button>
+                )}
 
-            {i === index && (
-              <span className="shrink-0 text-[11px] text-accent">Playing</span>
-            )}
+                {current && (
+                  <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide text-accent">
+                    On air
+                  </span>
+                )}
 
-            <button
-              type="button"
-              onClick={() => onRemove(item.id)}
-              aria-label={`Remove ${item.filename} from the queue`}
-              className="shrink-0 rounded-md px-2 py-1 text-[11px] text-muted transition hover:bg-red-500/15 hover:text-red-400"
-            >
-              Remove
-            </button>
-          </li>
-        ))}
-      </ol>
-
-      <p className="mt-3 text-xs text-muted">
-        Only queued items are shared, and only in this order. Viewers cannot add
-        to the queue, and never see the rest of your library.
-      </p>
-    </section>
+                {!readOnly && (
+                  <button
+                    type="button"
+                    onClick={() => onRemove(item.id)}
+                    aria-label={`Remove ${item.filename} from the playlist`}
+                    className="shrink-0 rounded-md px-1 text-lg leading-none text-muted opacity-0 transition group-hover:opacity-100 hover:text-red-400 focus-visible:opacity-100"
+                  >
+                    ×
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
   );
 }
