@@ -1,0 +1,82 @@
+# Deploy the static frontend (web/) to GitHub Pages.
+#
+#   https://<owner>.github.io/<repo>/
+#
+# One-time setup: repo **Settings → Pages → Build and deployment → Source =
+# "GitHub Actions"**. After that this workflow publishes on every push that
+# touches web/, and can be run by hand from the Actions tab.
+#
+# Two things specific to this app:
+#
+#  * GitHub Pages serves a *project* site from a sub-path, so the Vite build
+#    needs a matching `base` (passed here as VITE_BASE) or the hashed asset
+#    URLs 404. Change it to "/" if you put this on a custom domain or a user
+#    site (<owner>.github.io).
+#  * The backend is NOT deployed — it stays loopback on the host's machine. A
+#    viewer never calls it. The host's own browser loads this site and then
+#    calls http://localhost:8080 cross-origin, so start the Go server with the
+#    Pages origin allowed (origin only — no repo path):
+#
+#      ALLOWED_ORIGINS=https://<owner>.github.io go run ./cmd/server   # POSIX shell
+#      $env:ALLOWED_ORIGINS = "https://<owner>.github.io"; go run ./cmd/server   # PowerShell
+#
+# The app uses a hash router, so no SPA rewrite/404 fallback rules are needed.
+
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Queue deploys instead of cancelling: cancelling mid-deploy can leave the site
+# serving the previous build.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build
+        working-directory: web
+        env:
+          VITE_BASE: /${{ github.event.repository.name }}/
+        run: npm run build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
