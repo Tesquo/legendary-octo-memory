@@ -4,7 +4,6 @@ import {
   uploadMedia,
   reprocess,
   deleteMedia,
-  thumbnailUrl,
   playUrl,
 } from "./lib/api";
 import { LocalSession } from "./lib/MediaSession";
@@ -12,9 +11,9 @@ import { HostSession } from "./lib/webrtc";
 import { stateMessage } from "./lib/protocol";
 import { useProgress } from "./lib/useProgress";
 import Player from "./Player";
-import ShareToolbar from "./ShareToolbar";
-import QueueBar from "./QueueBar";
-import QueueList from "./QueueList";
+import RoomSidebar from "./RoomSidebar";
+import StagePanel from "./StagePanel";
+import LibraryList from "./LibraryList";
 
 /** Build the viewer link for a room, honouring any sub-path deployment. */
 function buildShareUrl(roomId) {
@@ -23,43 +22,32 @@ function buildShareUrl(roomId) {
   return `${origin}${base}#/watch/${roomId}`;
 }
 
-// Status pill shown on each card. Processing shows a live percentage.
-function StatusBadge({ status, progress }) {
-  const styles = {
-    ready: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-    processing: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-    failed: "bg-red-500/15 text-red-400 border-red-500/30",
-    imported: "bg-white/10 text-muted border-white/15",
-  };
-
-  const label =
-    status === "processing" && progress
-      ? `${Math.round(progress.percent)}%`
-      : status;
-
-  return (
-    <span
-      className={`rounded-full border px-2 py-0.5 text-[11px] font-medium capitalize ${
-        styles[status] || styles.imported
-      }`}
-    >
-      {label}
-    </span>
-  );
-}
-
+/**
+ * MediaLibrary is the host's side of the app, and it is room-first: choosing a
+ * file opens a room immediately — so the share link exists while the file is
+ * still being prepared — and playback starts from a deliberate press.
+ *
+ * The host is the only role that talks to the Go API. Viewers get the playlist
+ * over the data channel and the video over WebRTC (see WatchPage).
+ */
 export default function MediaLibrary() {
   const [items, setItems] = useState([]);
+
+  // The media the room is centred on. Setting it opens the room; it is what is
+  // being prepared, what is ready to start, or what is playing.
+  const [focusedId, setFocusedId] = useState(null);
   const [player, setPlayer] = useState(null); // { media, session }
-  // The queue is the host's own playlist, and the only view of the library that
-  // viewers are ever told about. `queueIndex` is the entry playing right now, or
-  // -1 when what is on screen did not come from the queue.
+
+  // The playlist is the host's own queue, and the only view of the library that
+  // viewers are ever told about. `queueIndex` is the entry on air, or -1.
   const [queue, setQueue] = useState([]);
   const [queueIndex, setQueueIndex] = useState(-1);
+
   const [share, setShare] = useState(null); // { roomId, viewers, copied }
   const [shareError, setShareError] = useState("");
   const [uploadPct, setUploadPct] = useState(null);
   const [error, setError] = useState("");
+  const [dragActive, setDragActive] = useState(false);
 
   const progress = useProgress();
   const fileInputRef = useRef(null);
@@ -72,9 +60,12 @@ export default function MediaLibrary() {
   // refresh.
   const handledRef = useRef(new Set());
 
-  // Event handlers read the queue through this ref rather than through state, so
-  // they can never act on a stale queue.
+  // Handlers read the queue through this ref rather than through state, so they
+  // can never act on a stale queue.
   const queueRef = useRef({ items: [], index: -1 });
+
+  const focusedItem = items.find((i) => i.id === focusedId) || null;
+  const inRoom = focusedId !== null;
 
   const refresh = useCallback(async () => {
     try {
@@ -129,22 +120,37 @@ export default function MediaLibrary() {
       ignore = true;
     };
   }, [progress]);
-
-  const onFileChange = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  /**
+   * Upload a file and centre the room on it. Choosing a file is what opens the
+   * room, so its link exists from here on and can be shared while the file is
+   * still being prepared. A file chosen while a room is already running simply
+   * becomes what the room plays next.
+   */
+  const uploadFile = async (file) => {
     setError("");
     setUploadPct(0);
     try {
-      await uploadMedia(file, setUploadPct);
+      const uploaded = await uploadMedia(file, setUploadPct);
       await refresh();
+      openRoom(uploaded.id);
     } catch (err) {
       setError(err.message);
     } finally {
       setUploadPct(null);
-      e.target.value = "";
     }
+  };
+
+  const onFileChange = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) uploadFile(file);
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault();
+    setDragActive(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (file) uploadFile(file);
   };
 
   const onReprocess = async (id) => {
@@ -164,12 +170,16 @@ export default function MediaLibrary() {
     setError("");
     try {
       await deleteMedia(id);
-      // If the deleted item is open in the player, close it; the session itself
-      // is released by the effect that owns it.
-      if (player?.media.id === id) setPlayer(null);
-      // A deleted item cannot stay in the queue either: the files are gone, and
-      // viewers are being told exactly what is queued.
-      removeFromQueue(id);
+      if (focusedId === id) {
+        // The room's media is gone, so end the session rather than leaving
+        // viewers attached to a room with nothing in it.
+        leaveRoom();
+      } else {
+        // A deleted item cannot stay in the playlist either: the files are gone,
+        // and viewers are being told exactly what is queued.
+        if (player?.media.id === id) setPlayer(null);
+        removeFromQueue(id);
+      }
       await refresh();
     } catch (err) {
       setError(err.message);
@@ -185,10 +195,55 @@ export default function MediaLibrary() {
   };
 
   /**
-   * Replace the queue and tell every viewer. The host owns the queue outright:
-   * viewers are read-only and cannot ask the API for anything, so the whole
-   * shared state travels over the data channel. `index` is the queue entry now
-   * playing, or -1 when what is on screen did not come from the queue.
+   * Open a room centred on a media item, creating the peer session the first
+   * time. The link is live from this point — before the file is playable — so it
+   * can be handed out while preparation is still running.
+   */
+  const openRoom = async (id) => {
+    setError("");
+    setShareError("");
+    setFocusedId(id);
+
+    // Moving the room to a different item stops whatever is on screen, so the
+    // stage can show the new file being prepared or ready to start.
+    if (player && player.media.id !== id) setPlayer(null);
+
+    if (hostRef.current) return;
+
+    try {
+      const host = new HostSession({
+        onViewersChange: (viewers) =>
+          setShare((s) => (s ? { ...s, viewers } : s)),
+        onError: (err) => setShareError(err.message),
+      });
+      hostRef.current = host;
+
+      const roomId = await host.start();
+      // The queue is the only view of the host a viewer ever gets, so it is sent
+      // as soon as there is a room to send it to.
+      host.setSnapshot(stateMessage(queueRef.current));
+      setShare({ roomId, viewers: 0, copied: false });
+
+      // The player may already be mounted (a file added mid-session); capture
+      // from it now rather than waiting for another load event.
+      if (videoElRef.current) handleVideoReady(videoElRef.current);
+    } catch (err) {
+      setShareError("Could not start sharing: " + err.message);
+    }
+  };
+
+  /** Leave the room: end the peer session and clear everything it owned. */
+  const leaveRoom = () => {
+    stopSharing();
+    setPlayer(null);
+    setFocusedId(null);
+    publishQueue([], -1);
+  };
+  /**
+   * Replace the playlist and tell every viewer. The host owns the queue
+   * outright: viewers are read-only and cannot ask the API for anything, so the
+   * whole shared state travels over the data channel. `index` is the queue entry
+   * on air, or -1 when nothing on the playlist is playing.
    */
   const publishQueue = (items, index) => {
     // The ref is written in the same tick as the state, so a handler that runs
@@ -200,7 +255,7 @@ export default function MediaLibrary() {
     hostRef.current?.setSnapshot(stateMessage({ items, index }));
   };
 
-  /** Add an item to the end of the queue. */
+  /** Add an item to the end of the playlist without playing it. */
   const addToQueue = (item) => {
     const { items, index } = queueRef.current;
     if (items.some((i) => i.id === item.id)) return;
@@ -208,10 +263,9 @@ export default function MediaLibrary() {
   };
 
   /**
-   * Remove a queued item. Removing the one that is playing stops the queue
-   * tracking it (index -1) rather than jumping to a neighbour: what is on screen
-   * stays, but the queue will not auto-advance from a position that no longer
-   * exists.
+   * Remove a playlist entry. Dropping the entry that is on air stops it too: the
+   * playlist is the shared truth about what is playing, so a viewer is never
+   * left watching something the queue does not name.
    */
   const removeFromQueue = (id) => {
     const { items, index } = queueRef.current;
@@ -226,14 +280,8 @@ export default function MediaLibrary() {
       items.filter((i) => i.id !== id),
       nextIndex,
     );
-  };
 
-  const toggleQueue = (item) => {
-    if (queueRef.current.items.some((i) => i.id === item.id)) {
-      removeFromQueue(item.id);
-      return;
-    }
-    addToQueue(item);
+    if (at === index && player?.media.id === id) setPlayer(null);
   };
 
   const clearQueue = () => publishQueue([], -1);
@@ -249,60 +297,28 @@ export default function MediaLibrary() {
   };
 
   /**
-   * Start playing an item — from the grid, from the queue, or by auto-advance.
-   * A single entry point keeps `queueIndex` honest: an item is "at" its queue
-   * position, or -1 when it is not in the queue at all.
+   * Play an item — from the playlist, or when the room's file becomes ready. It
+   * joins the playlist if it is not on it, so the queue always names what is on
+   * air. A single entry point keeps `queueIndex` honest: an item is on air at
+   * its playlist position.
    */
   const playItem = (item) => {
     const { items } = queueRef.current;
-    const at = items.findIndex((i) => i.id === item.id);
+    let next = items;
+    let at = items.findIndex((i) => i.id === item.id);
+    if (at === -1) {
+      next = [...items, item];
+      at = next.length - 1;
+    }
 
     const session = new LocalSession({ src: playUrl(item.id) });
     // Subscribing here rather than in an effect keeps the handler out of a
     // dependency array; it reads refs only, so it cannot go stale.
     session.on("ended", handleEnded);
 
+    setFocusedId(item.id);
     setPlayer({ media: item, session });
-    publishQueue(items, at);
-  };
-
-  const closePlayer = () => {
-    stopSharing();
-    // Dropping the player releases its session — see the effect below.
-    setPlayer(null);
-  };
-
-  /**
-   * Start sharing: open the player and create a room. The media stream is
-   * captured from the host's own <video> element once it is mounted.
-   */
-  const startSharing = async (item) => {
-    setError("");
-    setShareError("");
-    playItem(item);
-
-    try {
-      const host = new HostSession({
-        onViewersChange: (viewers) =>
-          setShare((s) => (s ? { ...s, viewers } : s)),
-        // Surfaced in the player footer: a message on the page behind the modal
-        // would never be seen.
-        onError: (err) => setShareError(err.message),
-      });
-      hostRef.current = host;
-
-      const roomId = await host.start();
-      setShare({ roomId, viewers: 0, copied: false });
-
-      // Tell viewers where the queue stands now, and keep it for whoever joins
-      // later: the queue is the only view of the host they ever get.
-      host.setSnapshot(stateMessage(queueRef.current));
-
-      // The player may already be mounted; if so, capture from it now.
-      if (videoElRef.current) handleVideoReady(videoElRef.current);
-    } catch (err) {
-      setShareError("Could not start sharing: " + err.message);
-    }
+    publishQueue(next, at);
   };
 
   /**
@@ -342,7 +358,6 @@ export default function MediaLibrary() {
       setError("Could not copy the link — please copy it manually.");
     }
   };
-
   // Tear down any live session when the library unmounts.
   useEffect(
     () => () => {
@@ -353,242 +368,210 @@ export default function MediaLibrary() {
 
   // The caller owns the session: Player attaches it but never destroys it. So
   // moving to the next queue item, or closing the player, has to release the one
-  // that is being replaced.
+  // being replaced.
   useEffect(() => {
     const session = player?.session;
     if (!session) return;
     return () => session.destroy();
   }, [player?.session]);
 
-  return (
-    <div className="min-h-full">
-      {/* Header */}
-      <header className="sticky top-0 z-30 border-b border-border bg-canvas/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
-          <div className="flex items-center gap-2">
-            <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
-              L
-            </span>
-            <h1 className="text-base font-semibold tracking-tight">
-              Local Media
-            </h1>
-          </div>
+  /** Ready files that are not already on the playlist. */
+  const queuedIds = new Set(queue.map((i) => i.id));
+  const addableMedia = items.filter(
+    (i) => i.status === "ready" && !queuedIds.has(i.id),
+  );
 
-          <div className="flex items-center gap-3">
-            {uploadPct !== null && (
-              <span className="hidden text-xs text-muted sm:block">
-                Uploading… {Math.round(uploadPct)}%
+  const fileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      accept="video/*"
+      onChange={onFileChange}
+      className="hidden"
+    />
+  );
+
+  // --- The room: a theatre with its sidebar ---------------------------------
+  if (inRoom) {
+    return (
+      <div
+        className="min-h-screen bg-canvas"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragActive(true);
+        }}
+        onDragLeave={() => setDragActive(false)}
+        onDrop={onDrop}
+      >
+        <header className="border-b border-border">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
+            <div className="flex items-center gap-2">
+              <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
+                L
               </span>
-            )}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/*"
-              onChange={onFileChange}
-              className="hidden"
-            />
+              <h1 className="text-base font-semibold tracking-tight">
+                Watch together
+              </h1>
+            </div>
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-accent-hover"
+              onClick={leaveRoom}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs text-muted transition hover:bg-white/10 hover:text-foreground"
             >
-              Upload video
+              Leave room
             </button>
           </div>
+        </header>
+
+        <div className="mx-auto max-w-6xl px-4 sm:px-6">
+          {error && (
+            <p className="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+              {error}
+            </p>
+          )}
+
+          <div className="flex flex-col gap-4 py-4 lg:flex-row lg:items-start">
+            <div className="flex min-w-0 justify-center lg:flex-1">
+              {player ? (
+                <Player
+                  key={player.media.id}
+                  mode="theatre"
+                  session={player.session}
+                  title={player.media.filename}
+                  subtitle={`${player.media.width}×${player.media.height} · ${player.media.video_codec} / ${player.media.audio_codec || "—"}`}
+                  onClose={leaveRoom}
+                  onVideoReady={handleVideoReady}
+                />
+              ) : (
+                /* No player yet: the room is open, and the stage shows the
+                   file being prepared or waiting to start. */
+                <StagePanel
+                  item={focusedItem}
+                  progress={
+                    focusedItem
+                      ? progress[`${focusedItem.id}:processing`]
+                      : null
+                  }
+                  onStart={() => playItem(focusedItem)}
+                />
+              )}
+            </div>
+
+            <RoomSidebar
+              role="host"
+              share={
+                share ? { ...share, url: buildShareUrl(share.roomId) } : null
+              }
+              shareError={shareError}
+              onCopy={copyShareLink}
+              onStop={leaveRoom}
+              items={queue}
+              index={queueIndex}
+              onPlay={playItem}
+              onRemove={removeFromQueue}
+              onClear={clearQueue}
+              library={addableMedia}
+              onAdd={addToQueue}
+              onUpload={() => fileInputRef.current?.click()}
+              uploadPct={uploadPct}
+            />
+          </div>
+        </div>
+
+        {fileInput}
+
+        {dragActive && (
+          <p className="pointer-events-none fixed bottom-6 left-1/2 z-40 -translate-x-1/2 rounded-full border border-accent bg-surface px-4 py-2 text-xs shadow-lg">
+            Drop the video to add it to the room
+          </p>
+        )}
+      </div>
+    );
+  }
+  // --- Home: choose something, or reopen something --------------------------
+  return (
+    <div
+      className="min-h-full"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragActive(true);
+      }}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={onDrop}
+    >
+      <header className="sticky top-0 z-30 border-b border-border bg-canvas/80 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center gap-2 px-4 py-3 sm:px-6">
+          <span className="grid h-8 w-8 place-items-center rounded-lg bg-accent text-sm font-bold text-white">
+            L
+          </span>
+          <h1 className="text-base font-semibold tracking-tight">
+            Watch together
+          </h1>
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
+      <main className="mx-auto max-w-5xl px-4 py-8 sm:px-6">
         {error && (
           <p className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
             {error}
           </p>
         )}
 
-        {queue.length > 0 && (
-          <QueueList
-            items={queue}
-            index={queueIndex}
-            onPlay={playItem}
-            onRemove={removeFromQueue}
-            onClear={clearQueue}
-          />
-        )}
-
-        {items.length === 0 ? (
-          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border py-24 text-center">
-            <p className="mb-1 text-sm font-medium">No media yet</p>
-            <p className="mb-5 text-sm text-muted">
-              Upload a video to get started. Playable files are ready instantly;
-              others are remuxed or transcoded automatically.
-            </p>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-accent-hover"
+        {/* The one thing to do on this screen: choose something to watch. */}
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={uploadPct !== null}
+          className={`flex w-full flex-col items-center justify-center rounded-3xl border border-dashed px-6 py-16 text-center transition disabled:opacity-60 ${
+            dragActive
+              ? "border-accent bg-accent/10"
+              : "border-border bg-surface hover:border-accent/60 hover:bg-surface-2"
+          }`}
+        >
+          <span className="grid h-14 w-14 place-items-center rounded-2xl bg-accent text-white">
+            <svg
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              className="h-7 w-7"
+              aria-hidden="true"
             >
-              Upload video
-            </button>
-          </div>
-        ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
-            {items.map((item) => {
-              const p = progress[`${item.id}:processing`];
-              const queuePosition = queue.findIndex((q) => q.id === item.id);
-              return (
-                <div
-                  key={item.id}
-                  className="group overflow-hidden rounded-xl border border-border bg-surface transition hover:border-accent/50"
-                >
-                  <div className="relative">
-                    <button
-                      type="button"
-                      onClick={() => playItem(item)}
-                      className="flex aspect-video w-full items-center justify-center bg-black"
-                    >
-                      {item.thumbnail ? (
-                        <img
-                          src={thumbnailUrl(item.thumbnail)}
-                          alt={item.filename}
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        <span className="text-xs text-muted">
-                          {item.status === "processing"
-                            ? "Processing…"
-                            : "No preview"}
-                        </span>
-                      )}
-                      <span className="absolute inset-0 grid place-items-center bg-black/0 opacity-0 transition group-hover:bg-black/30 group-hover:opacity-100">
-                        <span className="grid h-12 w-12 place-items-center rounded-full bg-white/90 text-canvas">
-                          <svg
-                            viewBox="0 0 24 24"
-                            fill="currentColor"
-                            className="ml-0.5 h-6 w-6"
-                          >
-                            <path d="M8 5v14l11-7z" />
-                          </svg>
-                        </span>
-                      </span>
-                    </button>
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          </span>
+          <span className="mt-5 text-lg font-semibold">
+            {uploadPct !== null
+              ? `Uploading… ${Math.round(uploadPct)}%`
+              : "Select media to start a watch party"}
+          </span>
+          <span className="mt-2 max-w-md text-sm text-muted">
+            Pick a video from this machine, or drop it here. A room opens
+            straight away with a link you can send to anyone — and you keep
+            control of playback.
+          </span>
+        </button>
 
-                    {/* Queue toggle. A sibling of the play button rather than a
-                        child of it: a button cannot nest inside a button. Only
-                        ready items are queued — viewers are shown the order, so
-                        it must only ever contain playable files. */}
-                    {item.status === "ready" && (
-                      <button
-                        type="button"
-                        onClick={() => toggleQueue(item)}
-                        title={
-                          queuePosition === -1
-                            ? "Add to the queue"
-                            : "Remove from the queue"
-                        }
-                        className={`absolute right-2 top-2 rounded-full border px-2 py-0.5 text-[11px] font-medium transition focus-visible:opacity-100 ${
-                          queuePosition === -1
-                            ? "border-white/20 bg-black/60 text-white/80 opacity-0 group-hover:opacity-100"
-                            : "border-accent bg-accent text-white"
-                        }`}
-                      >
-                        {queuePosition === -1
-                          ? "Queue"
-                          : `#${queuePosition + 1}`}
-                      </button>
-                    )}
-                  </div>
+        {fileInput}
 
-                  <div className="p-3">
-                    <p
-                      className="truncate text-sm font-medium"
-                      title={item.filename}
-                    >
-                      {item.filename}
-                    </p>
-
-                    <div className="mt-2 flex items-center justify-between gap-2">
-                      <StatusBadge status={item.status} progress={p} />
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() => startSharing(item)}
-                          disabled={item.status !== "ready"}
-                          className="rounded-md px-2 py-1 text-[11px] font-medium text-accent transition hover:bg-accent/15 disabled:cursor-not-allowed disabled:text-muted disabled:hover:bg-transparent"
-                        >
-                          Share
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onReprocess(item.id)}
-                          className="rounded-md px-2 py-1 text-[11px] text-muted transition hover:bg-white/10 hover:text-foreground"
-                        >
-                          Re-process
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onDelete(item.id)}
-                          className="rounded-md px-2 py-1 text-[11px] text-muted transition hover:bg-red-500/15 hover:text-red-400"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-
-                    {p?.stage === "processing" && (
-                      <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-white/10">
-                        <div
-                          className="h-full rounded-full bg-accent transition-[width]"
-                          style={{ width: `${p.percent}%` }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        {items.length > 0 && (
+          <section className="mt-10">
+            <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">
+              Or open something from your library
+            </h2>
+            <LibraryList
+              items={items}
+              progress={progress}
+              onSelect={(item) => openRoom(item.id)}
+              selectLabel="Open in a room"
+              onReprocess={onReprocess}
+              onDelete={onDelete}
+            />
+          </section>
         )}
       </main>
-
-      {player && (
-        <Player
-          key={player.media.id}
-          session={player.session}
-          title={player.media.filename}
-          subtitle={`${player.media.width}×${player.media.height} · ${player.media.video_codec} / ${player.media.audio_codec || "—"}`}
-          onClose={closePlayer}
-          onVideoReady={handleVideoReady}
-          toolbar={
-            <div className="flex min-w-0 items-center gap-2">
-              {/* The queue lives in the player's chrome because the player is a
-                  full-viewport modal: anything outside it is painted
-                  underneath. */}
-              <QueueBar
-                items={queue}
-                index={queueIndex}
-                onNext={(nextIndex) => playItem(queue[nextIndex])}
-              />
-
-              {share ? (
-                <ShareToolbar
-                  url={buildShareUrl(share.roomId)}
-                  viewers={share.viewers}
-                  copied={share.copied}
-                  onCopy={copyShareLink}
-                  onStop={stopSharing}
-                />
-              ) : shareError ? (
-                <span
-                  className="max-w-[24rem] shrink-0 truncate text-xs text-red-400"
-                  title={shareError}
-                >
-                  {shareError}
-                </span>
-              ) : null}
-            </div>
-          }
-        />
-      )}
     </div>
   );
 }
+
+
+
+
