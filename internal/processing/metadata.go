@@ -1,10 +1,15 @@
 package processing
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/Tesquo/legendary-octo-memory/internal/ffmpeg"
 )
@@ -19,19 +24,44 @@ type Metadata struct {
 	BitRate    int64
 }
 
+// probeTimeout bounds a single ffprobe run. A malformed file can make ffprobe
+// hang, and without a bound the upload handler never answers while the item's
+// directory stays behind.
+const probeTimeout = 30 * time.Second
+
+// ErrToolMissing reports that ffprobe could not be started at all, as opposed to
+// the file being unreadable. The API needs the difference: a missing toolchain is
+// this server's problem (500), not the uploader's (400).
+var ErrToolMissing = errors.New("ffprobe executable not found")
+
 func ExtractMetadata(path string) (*Metadata, error) {
-	cmd := exec.Command(ffmpeg.FFprobePath(),
-		"-v", "quiet",
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ffmpeg.FFprobePath(),
+		"-v", "error",
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
 		path,
 	)
 
-	out, err := cmd.CombinedOutput()
+	// Output rather than CombinedOutput, so stderr cannot land in the JSON. Go
+	// stashes stderr in the ExitError for the error below, which keeps a failure
+	// diagnosable instead of silencing it as -v quiet did.
+	out, err := cmd.Output()
 	if err != nil {
-		fmt.Println("ffprobe error:", string(out))
-		return nil, err
+		switch {
+		case ctx.Err() != nil:
+			return nil, fmt.Errorf("ffprobe timed out after %s: %w", probeTimeout, err)
+		case errors.Is(err, exec.ErrNotFound), errors.Is(err, fs.ErrNotExist):
+			return nil, fmt.Errorf("%w: %v", ErrToolMissing, err)
+		}
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return nil, fmt.Errorf("ffprobe: %w: %s", err, strings.TrimSpace(string(exit.Stderr)))
+		}
+		return nil, fmt.Errorf("ffprobe: %w", err)
 	}
 
 	var probe struct {

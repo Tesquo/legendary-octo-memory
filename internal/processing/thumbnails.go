@@ -1,9 +1,12 @@
 package processing
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/Tesquo/legendary-octo-memory/internal/ffmpeg"
 )
@@ -11,6 +14,10 @@ import (
 // thumbnailWidth is the width thumbnails are scaled to. Height is derived to
 // preserve aspect ratio (the "-2" in the scale filter keeps it even).
 const thumbnailWidth = 480
+
+// thumbnailTimeout bounds one attempt. A thumbnail is a convenience, so a file
+// that makes ffmpeg hang is abandoned rather than occupying a goroutine forever.
+const thumbnailTimeout = 60 * time.Second
 
 // GenerateThumbnail writes a JPEG preview of videoPath into outputDir and
 // returns its path. It attempts a frame ~1s in (a representative moment), but
@@ -37,7 +44,9 @@ func GenerateThumbnail(videoPath, outputDir string) (string, error) {
 }
 
 func runThumbnail(videoPath, thumbPath string, seekArgs []string, scale string) error {
-	args := []string{"-y"}
+	// -v error comes first because these are global options, and it keeps
+	// ffmpeg's banner and progress chatter out of the buffer below.
+	args := []string{"-y", "-v", "error"}
 	args = append(args, seekArgs...)
 	args = append(args,
 		"-i", videoPath,
@@ -47,10 +56,16 @@ func runThumbnail(videoPath, thumbPath string, seekArgs []string, scale string) 
 		thumbPath,
 	)
 
-	cmd := exec.Command(ffmpeg.FFmpegPath(), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), thumbnailTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ffmpeg.FFmpegPath(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ffmpeg thumbnail: %v: %s", err, string(out))
+		if ctx.Err() != nil {
+			return fmt.Errorf("ffmpeg thumbnail timed out after %s", thumbnailTimeout)
+		}
+		return fmt.Errorf("ffmpeg thumbnail: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
