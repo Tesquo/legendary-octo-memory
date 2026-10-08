@@ -4,6 +4,8 @@ A local media player with a Go backend and a React frontend that runs in the
 browser. The Go layer turns arbitrary local files into something a browser can
 play, which is the hard part it exists to solve.
 
+### DISCLAIMER: This should not be used seriously by anyone! It's a dumb project idea that I've simply been curious about
+
 ## Architecture
 
 - **Go backend (`:8080`)** — runs on the host machine only. Classifies local
