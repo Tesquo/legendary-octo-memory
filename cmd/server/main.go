@@ -13,11 +13,20 @@ import (
 
 	"github.com/Tesquo/legendary-octo-memory/config"
 	"github.com/Tesquo/legendary-octo-memory/internal/api"
+	"github.com/Tesquo/legendary-octo-memory/internal/ffmpeg"
 	"github.com/Tesquo/legendary-octo-memory/internal/storage"
 )
 
 func main() {
 	cfg := config.Load()
+
+	// State whether the media toolchain could be found, once, up front. The
+	// search has an order and the answer is fixed for the process (see
+	// internal/ffmpeg), so this is the only place it needs saying; without it a
+	// missing ffmpeg turns into an unexplained failure on every upload.
+	if err := ffmpeg.Verify(); err != nil {
+		log.Printf("warning: %v", err)
+	}
 
 	db, err := storage.InitDB()
 	if err != nil {
@@ -40,6 +49,15 @@ func main() {
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: router,
+
+		// Bound how long a client may spend sending request headers, and how
+		// long an idle connection is kept. ReadTimeout is deliberately absent:
+		// one upload can legitimately take minutes, and the body is already
+		// capped by MaxUploadBytes. WriteTimeout is absent for the same reason —
+		// /progress is a long-lived event stream and /play serves large ranged
+		// responses, and a write deadline would cut both off mid-flight.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	// Run the server in the background so we can wait for a shutdown signal.

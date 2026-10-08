@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 
@@ -121,11 +122,12 @@ func (s *Server) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	// media/<id>/ and would recreate the directory RemoveAll is about to delete.
 	s.Pipeline.CancelAndWait(id)
 
-	// Best-effort cleanup of artefacts. A failure here leaves orphaned files
-	// but the item is already gone from the user's library, so it is not fatal.
+	// Best-effort cleanup of artefacts. A failure here leaves files behind, but
+	// the item is already gone from the user's library, so it is logged rather
+	// than reported: the row cannot be deleted twice, and echoing the OS error
+	// would hand the client a filesystem path.
 	if err := os.RemoveAll(mediaDir(id)); err != nil {
-		http.Error(w, "delete files: "+err.Error(), http.StatusInternalServerError)
-		return
+		log.Printf("delete media %s: removing files: %v", id, err)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

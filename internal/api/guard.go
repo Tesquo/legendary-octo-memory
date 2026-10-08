@@ -5,16 +5,28 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // securityHeaders applies response headers that should hold for every route.
 //
-// nosniff matters here because /media-file and /open serve files whose type is
-// derived from a user-supplied extension. Without it a browser is free to sniff
-// an uploaded file into something else and execute it in the API's origin.
+// Nothing this API serves is a document, and these say so. A Content-Security-
+// Policy of default-src 'none' plus sandbox means that even if a stored file is
+// rendered as a document anyway — the case nosniff alone cannot rule out, since
+// a file whose extension already claims text/html needs no sniffing — it can run
+// no script, load no subresource, and is treated as a unique origin, which is
+// what keeps an uploaded page from calling this API as a same-origin client.
+// frame-ancestors (with the older X-Frame-Options spelling for good measure)
+// stops another site framing the API, and no-referrer keeps library URLs out of a
+// third party's logs.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -136,6 +148,29 @@ func (s *Server) guardRequests(next http.Handler) http.Handler {
 			}
 		}
 
+		next.ServeHTTP(w, r)
+	})
+}
+
+// validID reports whether id is an id this server could have issued. uuid.Parse
+// accepts a few other spellings (braces, a URN prefix, no dashes); those are
+// canonicalised away here, so what arrives must be exactly the form uuid.New
+// produced. Ids are used to build filesystem paths, so a value that is not one of
+// ours is refused rather than passed on to be looked up or joined.
+func validID(id string) bool {
+	parsed, err := uuid.Parse(id)
+	return err == nil && parsed.String() == id
+}
+
+// validMediaID turns away a request whose {id} is not a UUID before any handler
+// sees it. A malformed id is answered 404 rather than 400: from outside, "no such
+// item" and "not an id at all" should be indistinguishable.
+func validMediaID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validID(chi.URLParam(r, "id")) {
+			http.NotFound(w, r)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }

@@ -19,41 +19,46 @@ func NewRouter(s *Server) http.Handler {
 
 	// CORS so the Vite dev server (and any static host) can talk to the API.
 	// Origins are configuration-driven so a deployed frontend can be added
-	// without a code change.
+	// without a code change. Credentials stay off: the API has no cookies and no
+	// auth headers, so nothing needs them
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   s.Config.AllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		AllowCredentials: true,
+		AllowCredentials: false,
 	}))
 
 	// Health
 	r.Get("/health", s.HealthHandler)
 
-	// Library
+	// Library. Every route that takes an {id} goes through validMediaID, which
+	// turns away anything that is not a UUID this server issued before it can
+	// reach the database or the filesystem.
 	r.Get("/media", s.MediaListHandler)
-	r.Get("/media/{id}", s.MediaDetailHandler)
-	r.Delete("/media/{id}", s.DeleteHandler)
+	r.With(validMediaID).Get("/media/{id}", s.MediaDetailHandler)
+	r.With(validMediaID).Delete("/media/{id}", s.DeleteHandler)
 
 	// Ingestion and processing
 	r.Post("/upload", s.UploadHandler)
-	r.Post("/reprocess/{id}", s.ReprocessHandler)
+	r.With(validMediaID).Post("/reprocess/{id}", s.ReprocessHandler)
 
 	// Playback: serve the prepared rendition with HTTP range support so the
 	// <video> element can seek instantly.
-	r.Get("/play/{id}", s.PlayHandler)
-	r.Head("/play/{id}", s.PlayHandler)
+	r.With(validMediaID).Get("/play/{id}", s.PlayHandler)
+	r.With(validMediaID).Head("/play/{id}", s.PlayHandler)
 
 	// Raw source file, used by the sharing flow.
-	r.Get("/open/{id}", s.OpenHandler)
+	r.With(validMediaID).Get("/open/{id}", s.OpenHandler)
 
 	// Live pipeline progress (Server-Sent Events).
 	r.Get("/progress", s.ProgressHandler)
 
-	// Static media (thumbnails and renditions) via http.FileServer, which also
-	// supports HTTP range requests. The mount path is shared with relPath so the
-	// URLs clients build always match a real route.
-	r.Handle("/"+MediaURLPrefix+"/*", http.StripPrefix("/"+MediaURLPrefix+"/", http.FileServer(http.Dir(MediaDir))))
+	// Static media (thumbnails and renditions). serveMediaFile owns the
+	// Content-Type instead of deriving it from the file extension, refuses
+	// directory requests, and keeps every request inside media/<id>/. The mount
+	// path is shared with relPath so the URLs clients build always match a real
+	// route.
+	r.Handle("/"+MediaURLPrefix+"/*", http.StripPrefix("/"+MediaURLPrefix+"/", http.HandlerFunc(s.serveMediaFile)))
 
 	return r
 }
